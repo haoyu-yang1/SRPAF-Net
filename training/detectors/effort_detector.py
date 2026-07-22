@@ -26,15 +26,194 @@ from transformers import AutoProcessor, CLIPModel, ViTModel, ViTConfig
 
 logger = logging.getLogger(__name__)
 
+class SafeLargeSelectiveKernel(nn.Module):
+    """
+    Baseline-safe LSK
+    只学习一个空间残差 delta，不再直接 identity * attention 强乘。
+    初始时接近恒等映射，避免拉低 baseline。
+    """
+    def __init__(self, dim):
+        super(SafeLargeSelectiveKernel, self).__init__()
 
-@DETECTOR.register_module(module_name='effort')
-class EffortDetector(nn.Module):
+        hidden_dim = dim // 2
+
+        self.conv0 = nn.Conv2d(
+            dim, dim, kernel_size=5, padding=2, groups=dim, bias=False
+        )
+
+        self.conv_spatial = nn.Conv2d(
+            dim, dim, kernel_size=7, stride=1,
+            padding=9, groups=dim, dilation=3, bias=False
+        )
+
+        self.conv1 = nn.Conv2d(dim, hidden_dim, kernel_size=1, bias=False)
+        self.conv2 = nn.Conv2d(dim, hidden_dim, kernel_size=1, bias=False)
+
+        self.conv_squeeze = nn.Conv2d(
+            2, 2, kernel_size=7, padding=3, bias=False
+        )
+
+        self.delta_proj = nn.Sequential(
+            nn.Conv2d(hidden_dim, dim, kernel_size=1, bias=False),
+            nn.GroupNorm(32, dim),
+            nn.GELU(),
+            nn.Conv2d(dim, dim, kernel_size=1, bias=False)
+        )
+
+        # 初始很小，保证一开始几乎等于 baseline
+        self.lsk_scale = nn.Parameter(torch.ones(1) * 1.5e-2)
+
+    def forward(self, x):
+        identity = x
+
+        attn1 = self.conv0(x)
+        attn2 = self.conv_spatial(attn1)
+
+        attn1 = self.conv1(attn1)
+        attn2 = self.conv2(attn2)
+
+        attn = torch.cat([attn1, attn2], dim=1)
+
+        avg_attn = torch.mean(attn, dim=1, keepdim=True)
+        max_attn, _ = torch.max(attn, dim=1, keepdim=True)
+
+        agg = torch.cat([avg_attn, max_attn], dim=1)
+        sig = self.conv_squeeze(agg).sigmoid()
+
+        feat = attn1 * sig[:, 0:1, :, :] + attn2 * sig[:, 1:2, :, :]
+
+        delta = self.delta_proj(feat)
+
+        # 去掉残差的全局偏移，避免整体改变 CLIP 特征分布
+        delta = delta - delta.mean(dim=(2, 3), keepdim=True)
+
+        scale = torch.clamp(self.lsk_scale, min=0.0, max=0.12)
+
+        out = identity + scale * delta
+
+        return out
+
+class PhaseAmpFreqAttentionBlock(nn.Module):
+    """
+    Baseline-safe PAFA
+    由 PAFA 生成频域残差 freq_delta，再用 gate 控制是否加入。
+    不再输出 [0,1] mask 去直接放大原始特征。
+    """
+    def __init__(self, dim=1024, h=16, w=16):
+        super(PhaseAmpFreqAttentionBlock, self).__init__()
+
+        self.amp_filter = nn.Parameter(
+            torch.randn(1, dim, h, w // 2 + 1, dtype=torch.float32) * 1e-3
+        )
+
+        self.pha_filter = nn.Parameter(
+            torch.randn(1, dim, h, w // 2 + 1, dtype=torch.float32) * 1e-3
+)
+        self.freq_perturb_scale = nn.Parameter(torch.ones(1) * 0.08)
+
+        self.spatial_gate = nn.Sequential(
+            nn.Conv2d(dim * 2, dim // 4, kernel_size=1, bias=False),
+            nn.GroupNorm(32, dim // 4),
+            nn.GELU(),
+            nn.Conv2d(dim // 4, 1, kernel_size=1, bias=False),
+            nn.Sigmoid()
+        )
+
+        self.channel_gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(dim * 2, dim // 16, kernel_size=1, bias=False),
+            nn.GELU(),
+            nn.Conv2d(dim // 16, dim, kernel_size=1, bias=False),
+            nn.Sigmoid()
+        )
+
+        # 初始很小，PAFA 一开始接近恒等映射
+        self.pafa_scale = nn.Parameter(torch.ones(1) * 8e-3)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        dtype = x.dtype
+        x_float = x.float()
+
+        x_fft = torch.fft.rfft2(x_float, norm='ortho')
+
+        amp = torch.abs(x_fft + 1e-8)
+        pha = torch.angle(x_fft + 1e-8)
+
+        amp_filter = self.amp_filter
+        pha_filter = self.pha_filter
+
+        if amp_filter.shape[-2:] != amp.shape[-2:]:
+            amp_filter = F.interpolate(
+                amp_filter,
+                size=amp.shape[-2:],
+                mode='bilinear',
+                align_corners=False
+            )
+            pha_filter = F.interpolate(
+                pha_filter,
+                size=pha.shape[-2:],
+                mode='bilinear',
+                align_corners=False
+            )
+
+        perturb_scale = torch.clamp(
+            self.freq_perturb_scale, min=0.02, max=0.15
+        )
+
+        amp_filtered = amp * (1.0 + perturb_scale * torch.tanh(amp_filter))
+        pha_filtered = pha + perturb_scale * torch.tanh(pha_filter)
+
+        real_part = amp_filtered * torch.cos(pha_filtered)
+        imag_part = amp_filtered * torch.sin(pha_filtered)
+        x_fft_filtered = torch.complex(real_part, imag_part)
+
+        freq_feat = torch.fft.irfft2(
+            x_fft_filtered,
+            s=(H, W),
+            norm='ortho'
+        )
+
+        # PAFA 的核心：频域扰动残差
+        freq_delta = freq_feat - x_float
+
+        # 去掉全局偏移，避免整体漂移
+        freq_delta = freq_delta - freq_delta.mean(dim=(2, 3), keepdim=True)
+
+        # 用原始特征 + 频域残差幅值生成 gate
+        gate_input = torch.cat([x_float, torch.abs(freq_delta)], dim=1)
+
+        spatial_gate = self.spatial_gate(gate_input)
+        channel_gate = self.channel_gate(gate_input)
+
+        # 空间为主，通道为辅，避免 PAFA 过拟合某些通道
+        gate = spatial_gate * (0.80 + 0.20 * channel_gate)
+
+        pafa_scale = torch.clamp(self.pafa_scale, min=0.0, max=0.10)
+
+        out = x_float + pafa_scale * gate * freq_delta
+
+        return out.to(dtype=dtype), gate.to(dtype=dtype)
+
+@DETECTOR.register_module(module_name='effort_freq')
+class EffortFreqDetector(nn.Module):
     def __init__(self, config=None):
-        super(EffortDetector, self).__init__()
+        super(EffortFreqDetector, self).__init__()
         self.config = config
         self.backbone = self.build_backbone(config)
+
+        self.lsk_block = SafeLargeSelectiveKernel(dim=1024)
+        self.freq_block = PhaseAmpFreqAttentionBlock(dim=1024, h=16, w=16)
+
+        self.use_lsk = True  # 是否使用 LSK 模块，默认为 False，可以通过 config 设置为 True
+        self.use_pa_fgsa = True
+
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.feat_norm = nn.LayerNorm(1024)
+
         self.head = nn.Linear(1024, 2)
         self.loss_func = nn.CrossEntropyLoss()
+        self.enhance_logit_scale = nn.Parameter(torch.ones(1) * 0.35)
         self.prob, self.label = [], []
         self.correct, self.total = 0, 0
 
@@ -46,7 +225,7 @@ class EffortDetector(nn.Module):
         # std: [0.26862954, 0.26130258, 0.27577711]
         
         # ViT-L/14 224*224
-        clip_model = CLIPModel.from_pretrained("../../huggingface/hub/models--openai--clip-vit-large-patch14/snapshots/32bd64288804d66eefd0ccbe215aa642df71cc41/")
+        clip_model = CLIPModel.from_pretrained("/home/haoyu/DeepfakeBench/preprocessing/clip-vit-large-patch14")
 
         # Apply SVD to self_attn layers only
         # ViT-L/14 224*224: 1024-1
@@ -61,11 +240,31 @@ class EffortDetector(nn.Module):
         return clip_model.vision_model
 
     def features(self, data_dict: dict) -> torch.tensor:
-        feat = self.backbone(data_dict['image'])['pooler_output']
-        return feat
+        out = self.backbone(data_dict['image'])
+        # CLIP ViT-L/14 输入 224×224 时：
+    # last_hidden_state: [B, 257, 1024]
+    # 257 = 1 个 CLS token + 256 个 patch token
+        tokens = out['last_hidden_state']
+        patch_tokens = tokens[:, 1:, :]  # [B, 256, 1024]
+        B, N, C = patch_tokens.shape
+        H = W = int(math.sqrt(N))
+        assert H * W == N, f"Patch token number {N} cannot reshape to square map"
+        feat_map = patch_tokens.transpose(1, 2).contiguous().reshape(B, C, H, W)
+        if not hasattr(self, "debug_feature_printed"):
+            print("tokens:", tokens.shape)
+            print("patch_tokens:", patch_tokens.shape)
+            print("feat_map:", feat_map.shape)
+            self.debug_feature_printed = True
+        return feat_map
 
-    def classifier(self, features: torch.tensor) -> torch.tensor:
-        return self.head(features)
+
+
+    def classifier(self, feat_map: torch.Tensor):
+        feat_vec = self.pool(feat_map).flatten(1)
+        feat_vec = self.feat_norm(feat_vec)
+        pred = self.head(feat_vec)
+        return pred, feat_vec
+
 
     # def get_losses(self, data_dict: dict, pred_dict: dict) -> dict:
     #     label = data_dict['label']
@@ -112,7 +311,11 @@ class EffortDetector(nn.Module):
         pred = pred_dict['cls']     # Tensor of shape [batch_size, num_classes]
 
         # Compute overall loss using all samples
-        loss = self.loss_func(pred, label)
+        loss_main = self.loss_func(pred, label)
+        loss_base = self.loss_func(pred_dict['cls_base'], label)
+        loss_enhanced = self.loss_func(pred_dict['cls_enhanced'], label)
+
+        loss = loss_main + 0.10 * loss_base + 0.45 * loss_enhanced
 
         # Create masks for real and fake classes
         mask_real = label == 0  # Boolean tensor
@@ -157,18 +360,71 @@ class EffortDetector(nn.Module):
         metric_batch_dict = {'acc': acc, 'auc': auc, 'eer': eer, 'ap': ap}
         return metric_batch_dict
 
+
+
     def forward(self, data_dict: dict, inference=False) -> dict:
-        # get the features by backbone
-        features = self.features(data_dict)
-        # get the prediction by classifier
-        pred = self.classifier(features)
-        # get the probability of the pred
+        feat_spatial = self.features(data_dict)  # [B, 1024, 16, 16]
+
+        base_feat = feat_spatial
+
+        # SRS：空间响应选择与增强
+        if self.use_lsk:
+            feat_lsk = self.lsk_block(base_feat)
+        else:
+            feat_lsk = base_feat
+
+        # PAFA：对SRS增强后的特征进行频域建模
+        if self.use_pa_fgsa:
+            feat_pafa, attention_mask = self.freq_block(feat_lsk)
+        else:
+            attention_mask = None
+            feat_pafa = feat_lsk
+
+        feat_after_lsk = feat_lsk
+
+        lsk_res = feat_lsk - base_feat
+        pafa_res = feat_pafa - feat_lsk
+
+        feat_fused = base_feat + 1.3 * lsk_res + 0.45 * pafa_res
+
+        if not hasattr(self, "debug_pa_printed"):
+            print("feat_spatial:", feat_spatial.shape)
+            print("feat_after_lsk:", feat_after_lsk.shape)
+
+            if attention_mask is not None:
+                print("attention_mask:", attention_mask.shape)
+            else:
+                print("attention_mask: None")
+
+            print("feat_fused:", feat_fused.shape)
+            self.debug_pa_printed = True
+
+        pred_base, feat_vec_base = self.classifier(base_feat)
+        pred_enhanced, feat_vec = self.classifier(feat_fused)
+
+        base_prob = torch.softmax(pred_base.detach(), dim=1)
+        base_conf = torch.max(base_prob, dim=1, keepdim=True)[0]
+
+        hard_weight = 1.0 - base_conf
+        hard_weight = torch.clamp(hard_weight * 2.5, min=0.25, max=1.00)
+
+        eta = torch.clamp(self.enhance_logit_scale, min=0.10, max=0.65)
+
+        pred = pred_base + eta * hard_weight * (pred_enhanced - pred_base)
+
         prob = torch.softmax(pred, dim=1)[:, 1]
-        # build the prediction dict for each output
-        pred_dict = {'cls': pred, 'prob': prob, 'feat': features}
+
+        pred_dict = {
+            'cls': pred,
+            'cls_base': pred_base,
+            'cls_enhanced': pred_enhanced,
+            'prob': prob,
+            'feat': feat_vec
+        }
 
         return pred_dict
 
+      
 
 # Custom module to represent the residual using SVD components
 class SVDResidualLinear(nn.Module):
@@ -202,11 +458,14 @@ class SVDResidualLinear(nn.Module):
         if hasattr(self, 'U_residual') and hasattr(self, 'V_residual') and self.S_residual is not None:
             # Reconstruct the residual weight
             residual_weight = self.U_residual @ torch.diag(self.S_residual) @ self.V_residual
+            # print("residual_weight的形状：{}".format(residual_weight.shape)) [1024,1024]
             # Total weight is the fixed main weight plus the residual
             weight = self.weight_main + residual_weight
+            # print("weight的形状：{}".format(weight.shape)) [1024,1024]
         else:
             # If residual components are not set, use only the main weight
             weight = self.weight_main
+        
 
         return F.linear(x, weight, self.bias)
     
